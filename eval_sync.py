@@ -32,6 +32,20 @@ Usage:
         --robot.cameras="{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
         --task="Pick up the red cube" \\
         --duration=60
+
+Example:
+    python eval_sync.py \\
+        --policy.path=staudi25/pi05_lego_maximus_plus_aug \\
+        --policy.device=cuda \\
+        --robot.type=so101_follower \\
+        --robot.port=/dev/follower \\
+        --robot.id=videron_follower \\
+        --robot.cameras="{desk_cam: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}, gripper: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}}" \\
+        --task="Put all the legos on the table in the blue bowl" \\
+        --robot.calibration_dir=/Experiments \\
+        --duration=1000 \\
+        --visualize=true \\
+        --compress_images=true
 """
 
 import logging

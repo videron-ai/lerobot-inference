@@ -34,6 +34,23 @@ python eval_sync.py \
     --duration=60
 ```
 
+**Videron example:**
+
+```bash
+python eval_sync.py \
+    --policy.path=staudi25/pi05_lego_maximus_plus_aug \
+    --policy.device=cuda \
+    --robot.type=so101_follower \
+    --robot.port=/dev/follower \
+    --robot.id=videron_follower \
+    --robot.cameras="{desk_cam: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}, gripper: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: 'MJPG'}}" \
+    --task="Put all the legos on the table in the blue bowl" \
+    --robot.calibration_dir=/Experiments \
+    --duration=1000 \
+    --visualize=true \
+    --compress_images=true
+```
+
 ## Task Switching
 
 While the script is running, you can switch tasks by typing a task key and pressing Enter:
