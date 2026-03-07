@@ -93,11 +93,26 @@ DEFAULT_TASK_MAP = {
 
 
 def check_for_input(current_val: str, task_map: dict[str, str]) -> str:
-    """Non-blocking stdin check for task switching. Unix only (uses select.select).
+    """Non-blocking stdin check for runtime task switching. Unix only (uses select.select).
 
-    Reads a single line from stdin without blocking. If the line matches a key in
-    task_map, switches to that task and returns the new task string. Otherwise
-    returns current_val unchanged.
+    Uses ``select.select`` with a zero timeout to poll stdin without blocking the
+    control loop. If a line is available, it is read and matched against ``task_map``.
+    A matching key causes the returned task string to change; an unrecognised key
+    emits a warning and leaves the current task unchanged.
+
+    .. note::
+        ``select.select`` on file descriptors is Unix-specific. This function will
+        not work on Windows where stdin is not a socket-like object.
+
+    Args:
+        current_val (str): The task description that is currently active. Returned
+            unchanged when no input is available or the input is not a valid key.
+        task_map (dict[str, str]): Mapping from short keyboard keys (e.g. ``"1"``,
+            ``"2"``) to full task description strings (e.g. ``"Pick up the red cube"``).
+
+    Returns:
+        str: The newly selected task description if a valid key was typed, or
+        ``current_val`` if no input was available or the key was unrecognised.
     """
     if select.select([sys.stdin], [], [], 0)[0]:
         line = sys.stdin.readline().strip()
@@ -112,7 +127,44 @@ def check_for_input(current_val: str, task_map: dict[str, str]) -> str:
 
 @dataclass
 class SyncConfig(HubMixin):
-    """Configuration for synchronous inference with real robots."""
+    """Configuration dataclass for synchronous real-robot inference.
+
+    Parsed from CLI arguments by the LeRobot ``@parser.wrap()`` decorator and
+    optionally loadable from / saveable to the HuggingFace Hub via the
+    ``HubMixin`` base class.
+
+    Attributes:
+        policy (PreTrainedConfig | None): Policy configuration, populated
+            automatically from ``--policy.path`` during ``__post_init__``.
+            Contains all hyperparameters needed to reconstruct the model as
+            well as runtime settings such as ``device`` and ``pretrained_path``.
+            Must not be ``None`` after initialisation (enforced by validation).
+        robot (RobotConfig | None): Robot hardware configuration, e.g.
+            ``so101_follower``. Passed directly as a CLI argument group.
+            Must not be ``None`` after initialisation (enforced by validation).
+        duration (float): Total wall-clock time in seconds for which the
+            control loop runs. Default: ``30.0``.
+        fps (float): Target control frequency in Hz. The loop paces itself to
+            this rate using ``time.sleep``. Default: ``30.0``.
+        task (str): Natural-language description of the task the policy should
+            perform (e.g. ``"Pick up the red cube"``). Injected into every
+            observation batch as ``obs_dict["task"]``. If empty, the first
+            value in ``task_map`` is used as the default. Default: ``""``.
+        task_map (dict[str, str]): Optional mapping from single-character keys
+            to task description strings, used for runtime task switching via
+            stdin. Example: ``{"1": "Pick up cube", "2": "Place in bowl"}``.
+            If empty, ``DEFAULT_TASK_MAP`` is used. Default: ``{}``.
+        visualize (bool): Whether to stream observations to a running Rerun
+            viewer. Requires ``rerun-sdk`` to be installed. Default: ``False``.
+        rerun_session_name (str): Rerun recording/session identifier shown in
+            the viewer. Default: ``"eval_sync"``.
+        rerun_ip (str | None): IP address of the remote Rerun viewer. ``None``
+            connects to a local viewer. Default: ``None``.
+        rerun_port (int | None): Port of the remote Rerun viewer. ``None`` uses
+            the Rerun default port. Default: ``None``.
+        compress_images (bool): When ``True``, JPEG-compress camera images
+            before sending to Rerun to reduce bandwidth. Default: ``False``.
+    """
 
     policy: PreTrainedConfig | None = None
     robot: RobotConfig | None = None
@@ -131,7 +183,19 @@ class SyncConfig(HubMixin):
     rerun_port: int | None = None
     compress_images: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Resolve and validate fields that require post-construction logic.
+
+        Reads ``--policy.path`` from the CLI argument namespace via
+        ``parser.get_path_arg``, loads the corresponding ``PreTrainedConfig``
+        (applying any ``--policy.*`` CLI overrides), and stores it on
+        ``self.policy``. Also validates that a robot config was provided.
+
+        Raises:
+            ValueError: If ``--policy.path`` was not supplied on the command
+                line, or if ``self.robot`` is ``None`` after dataclass
+                initialisation.
+        """
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
@@ -145,11 +209,91 @@ class SyncConfig(HubMixin):
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
+        """Return the names of fields whose values are HuggingFace Hub paths.
+
+        Used by the ``HubMixin`` / LeRobot parser infrastructure to identify
+        which fields should be resolved as pretrained-model paths (Hub repo IDs
+        or local directories) rather than plain strings.
+
+        Returns:
+            list[str]: A list containing the single element ``"policy"``,
+            indicating that ``SyncConfig.policy`` is a path field.
+        """
         return ["policy"]
 
 
 @parser.wrap()
-def main(cfg: SyncConfig):
+def main(cfg: SyncConfig) -> None:
+    """Run the synchronous inference loop against a live robot.
+
+    This is the script's sole entry point. It performs the following stages in
+    order, then enters the control loop:
+
+    1. **Logging initialisation** — calls ``init_logging()`` and logs the
+       resolved configuration.
+    2. **Signal handling** — registers SIGINT/SIGTERM handlers via
+       ``ProcessSignalHandler`` so the loop exits cleanly on Ctrl-C.
+    3. **Policy loading** — instantiates the policy from ``cfg.policy``.
+       If ``cfg.policy.use_peft`` is ``True``, the base weights are loaded
+       first and the PEFT/LoRA adapter is applied on top.
+    4. **Processor loading** — creates a ``preprocessor`` that normalises
+       inputs and moves them to the target device, and a ``postprocessor``
+       that de-normalises the raw action tensor produced by the policy.
+    5. **Robot connection** — builds a ``Robot`` instance from ``cfg.robot``
+       and calls ``robot.connect()``.
+    6. **Rerun initialisation** (optional) — if ``cfg.visualize`` is ``True``,
+       starts a Rerun recording session.
+    7. **Control loop** — runs until ``cfg.duration`` seconds have elapsed or a
+       shutdown signal is received. Each iteration:
+
+       a. Checks stdin for a task-switch key (non-blocking).
+       b. Calls ``robot.get_observation()`` → applies the robot observation
+          processor → converts to a ``dict[str, torch.Tensor]`` batch.
+       c. Runs the preprocessor batch through ``policy.select_action()``.
+       d. Postprocesses the action tensor and sends it to the robot via
+          ``robot.send_action()``.
+       e. Sleeps to maintain the target FPS.
+
+    8. **Shutdown** — disconnects the robot in a ``finally`` block regardless
+       of how the loop exits.
+
+    Args:
+        cfg (SyncConfig): Fully resolved configuration dataclass. All fields
+            are validated during ``SyncConfig.__post_init__``; by the time
+            ``main`` is called, ``cfg.policy`` and ``cfg.robot`` are guaranteed
+            to be non-``None``.
+
+    Returns:
+        None
+
+    Raises:
+        Exception: Any unhandled exception from policy inference propagates
+            upward. Robot I/O errors (``get_observation``, ``send_action``)
+            are caught, logged, and cause the loop to break gracefully.
+
+    Data flow inside the loop (per step)::
+
+        robot.get_observation()
+            -> dict[str, np.ndarray]          # raw sensor readings
+        robot_observation_processor(obs)
+            -> dict[str, np.ndarray]          # standardised numpy arrays
+        build_dataset_frame(dataset_features, obs_processed)
+            -> dict[str, np.ndarray]          # named observation arrays
+        {torch.from_numpy, /255, permute, unsqueeze, .to(device)}
+            -> dict[str, torch.Tensor]        # shape (1, ...) on policy device
+        preprocessor(obs_dict)
+            -> dict[str, torch.Tensor]        # normalised batch
+        policy.select_action(batch)
+            -> torch.Tensor  shape (1, action_dim)
+        postprocessor(action).squeeze(0).cpu()
+            -> torch.Tensor  shape (action_dim,)  dtype float32
+        {key: tensor[i].item() for i, key in enumerate(robot.action_features)}
+            -> dict[str, float]               # one float per action dimension
+        robot_action_processor((action_dict, None))
+            -> robot-specific action object
+        robot.send_action(action_processed)
+            -> None
+    """
     init_logging()
     logger.info("Starting synchronous inference")
     logger.info(
