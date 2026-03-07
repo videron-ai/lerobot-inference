@@ -81,26 +81,32 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Subtracted from the target sleep duration to compensate for time.sleep() wake-up overhead.
+SLEEP_OVERHEAD_S = 0.001
 
-# --- TASK CONFIGURATION ---
-TASK_MAP = {
+# Default task map used for runtime task switching when none is provided via config.
+DEFAULT_TASK_MAP = {
     "1": "Put the red lego in the blue bowl",
     "2": "Put all the legos on the table in the blue bowl",
     "3": "Move the robot to the home position",
 }
-current_task = TASK_MAP["1"]
 
 
-def check_for_input(current_val: str) -> str:
-    """Non-blocking stdin check for task switching."""
+def check_for_input(current_val: str, task_map: dict[str, str]) -> str:
+    """Non-blocking stdin check for task switching. Unix only (uses select.select).
+
+    Reads a single line from stdin without blocking. If the line matches a key in
+    task_map, switches to that task and returns the new task string. Otherwise
+    returns current_val unchanged.
+    """
     if select.select([sys.stdin], [], [], 0)[0]:
         line = sys.stdin.readline().strip()
-        if line in TASK_MAP:
-            new_task = TASK_MAP[line]
-            print(f">>> SWITCHING TO: {new_task}")
+        if line in task_map:
+            new_task = task_map[line]
+            logger.info(f"SWITCHING TO: {new_task}")
             return new_task
         else:
-            print(f"Unknown command '{line}'. Available: {list(TASK_MAP.keys())}")
+            logger.warning(f"Unknown command '{line}'. Available: {list(task_map.keys())}")
     return current_val
 
 
@@ -113,6 +119,10 @@ class SyncConfig(HubMixin):
     duration: float = 30.0
     fps: float = 30.0
     task: str = field(default="", metadata={"help": "Default task to execute"})
+    task_map: dict[str, str] = field(
+        default_factory=dict,
+        metadata={"help": "Key-to-task-description map for runtime task switching via stdin"},
+    )
 
     # Rerun visualization
     visualize: bool = False
@@ -142,6 +152,10 @@ class SyncConfig(HubMixin):
 def main(cfg: SyncConfig):
     init_logging()
     logger.info("Starting synchronous inference")
+    logger.info(
+        f"  policy={cfg.policy.pretrained_path}  device={cfg.policy.device}"
+        f"  robot={cfg.robot.type}  duration={cfg.duration}s  fps={cfg.fps}  task='{cfg.task}'"
+    )
 
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = signal_handler.shutdown_event
@@ -149,18 +163,17 @@ def main(cfg: SyncConfig):
     # --- Load policy ---
     logger.info(f"Loading policy from {cfg.policy.pretrained_path}")
     policy_class = get_policy_class(cfg.policy.type)
-    config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
 
-    if config.use_peft:
+    if cfg.policy.use_peft:
         from peft import PeftConfig, PeftModel
 
         peft_config = PeftConfig.from_pretrained(cfg.policy.pretrained_path)
         policy = policy_class.from_pretrained(
-            pretrained_name_or_path=peft_config.base_model_name_or_path, config=config
+            pretrained_name_or_path=peft_config.base_model_name_or_path, config=cfg.policy
         )
         policy = PeftModel.from_pretrained(policy, cfg.policy.pretrained_path, config=peft_config)
     else:
-        policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
+        policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=cfg.policy)
 
     policy = policy.to(cfg.policy.device)
     policy.eval()
@@ -188,7 +201,10 @@ def main(cfg: SyncConfig):
     robot_action_processor = make_default_robot_action_processor()
     dataset_features = hw_to_dataset_features(robot.observation_features, "observation")
 
+    # --- Rerun visualization ---
     if cfg.visualize:
+        import rerun as rr
+
         init_rerun(
             session_name=cfg.rerun_session_name,
             ip=cfg.rerun_ip,
@@ -196,29 +212,32 @@ def main(cfg: SyncConfig):
         )
         logger.info("Rerun visualization initialized")
 
-    global current_task
-    if cfg.task:
-        current_task = cfg.task
+    # Resolve task map and initial task
+    task_map = cfg.task_map if cfg.task_map else DEFAULT_TASK_MAP
+    current_task = cfg.task if cfg.task else next(iter(task_map.values()), "")
 
     action_interval = 1.0 / cfg.fps
-    start_time = time.time()
+    start_time = time.perf_counter()
     step = 0
 
     logger.info(f"Running for {cfg.duration}s at {cfg.fps} Hz — task: '{current_task}'")
-    logger.info(f"Type a task key {list(TASK_MAP.keys())} + Enter to switch tasks")
+    logger.info(f"Type a task key {list(task_map.keys())} + Enter to switch tasks")
 
     try:
-        while not shutdown_event.is_set() and (time.time() - start_time) < cfg.duration:
+        while not shutdown_event.is_set() and (time.perf_counter() - start_time) < cfg.duration:
             t0 = time.perf_counter()
 
             # Non-blocking task switch from keyboard
-            current_task = check_for_input(current_task)
+            current_task = check_for_input(current_task, task_map)
 
             # --- Observation ---
-            obs = robot.get_observation()
+            try:
+                obs = robot.get_observation()
+            except Exception as e:
+                logger.error(f"Failed to get observation: {e}")
+                break
 
             if cfg.visualize:
-                import rerun as rr
                 rr.set_time_sequence("step", step)
                 log_rerun_data(observation=obs, compress_images=cfg.compress_images)
 
@@ -248,17 +267,26 @@ def main(cfg: SyncConfig):
                 key: action_postprocessed[i].item()
                 for i, key in enumerate(robot.action_features)
             }
-            action_processed = robot_action_processor((action_dict, None))
-            robot.send_action(action_processed)
+
+            try:
+                action_processed = robot_action_processor((action_dict, None))
+                robot.send_action(action_processed)
+            except Exception as e:
+                logger.error(f"Failed to send action: {e}")
+                break
 
             step += 1
             if step % 50 == 0:
-                elapsed = time.time() - start_time
-                logger.info(f"[MAIN] step={step}  elapsed={elapsed:.1f}s  task='{current_task}'")
+                elapsed = time.perf_counter() - start_time
+                actual_fps = step / elapsed if elapsed > 0 else 0.0
+                logger.info(
+                    f"[MAIN] step={step}  elapsed={elapsed:.1f}s  fps={actual_fps:.1f}  task='{current_task}'"
+                )
 
-            # Pace the loop to target fps
+            # Pace the loop to target fps; subtract SLEEP_OVERHEAD_S to compensate for
+            # the typical wake-up latency of time.sleep().
             dt = time.perf_counter() - t0
-            time.sleep(max(0.0, action_interval - dt - 0.001))
+            time.sleep(max(0.0, action_interval - dt - SLEEP_OVERHEAD_S))
 
     finally:
         logger.info("Shutting down")
